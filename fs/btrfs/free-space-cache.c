@@ -753,6 +753,14 @@ static int __load_free_space_cache(struct btrfs_root *root, struct inode *inode,
 			goto free_cache;
 		}
 
+		/*
+		 * Sync discard ensures that the free space cache is always
+		 * trimmed.  So when reading this in, the state should reflect
+		 * that.
+		 */
+		if (btrfs_test_opt(fs_info, DISCARD_SYNC))
+			e->trim_state = BTRFS_TRIM_STATE_TRIMMED;
+
 		if (!e->bytes) {
 			kmem_cache_free(btrfs_free_space_cachep, e);
 			goto free_cache;
@@ -2162,6 +2170,23 @@ out:
 	return ret;
 }
 
+/*
+ * Free space merging rules:
+ *  1) Merge trimmed areas together
+ *  2) Let untrimmed areas coalesce with trimmed areas
+ *  3) Always pull neighboring regions from bitmaps
+ *
+ * The above rules are for when we merge free space based on btrfs_trim_state.
+ * Rules 2 and 3 are subtle because they are suboptimal, but are done for the
+ * same reason: to promote larger extent regions which makes life easier for
+ * find_free_extent().  Rule 2 enables coalescing based on the common path
+ * being returning free space from btrfs_finish_extent_commit().  So when free
+ * space is trimmed, it will prevent aggregating trimmed new region and
+ * untrimmed regions in the rb_tree.  Rule 3 is purely to obtain larger extents
+ * and provide find_free_extent() with the largest extents possible hoping for
+ * the reuse path.
+ *
+ */
 static bool try_merge_free_space(struct btrfs_free_space_ctl *ctl,
 			  struct btrfs_free_space *info, bool update_stat)
 {
@@ -2170,6 +2195,7 @@ static bool try_merge_free_space(struct btrfs_free_space_ctl *ctl,
 	bool merged = false;
 	u64 offset = info->offset;
 	u64 bytes = info->bytes;
+	const bool is_trimmed = btrfs_free_space_trimmed(info);
 
 	/*
 	 * first we want to see if there is free space adjacent to the range we
@@ -2183,7 +2209,9 @@ static bool try_merge_free_space(struct btrfs_free_space_ctl *ctl,
 	else
 		left_info = tree_search_offset(ctl, offset - 1, 0, 0);
 
-	if (right_info && !right_info->bitmap) {
+	/* See try_merge_free_space() comment. */
+	if (right_info && !right_info->bitmap &&
+	    (!is_trimmed || btrfs_free_space_trimmed(right_info))) {
 		if (update_stat)
 			unlink_free_space(ctl, right_info);
 		else
@@ -2193,8 +2221,10 @@ static bool try_merge_free_space(struct btrfs_free_space_ctl *ctl,
 		merged = true;
 	}
 
+	/* See try_merge_free_space() comment. */
 	if (left_info && !left_info->bitmap &&
-	    left_info->offset + left_info->bytes == offset) {
+	    left_info->offset + left_info->bytes == offset &&
+	    (!is_trimmed || btrfs_free_space_trimmed(left_info))) {
 		if (update_stat)
 			unlink_free_space(ctl, left_info);
 		else
@@ -2229,6 +2259,10 @@ static bool steal_from_bitmap_to_end(struct btrfs_free_space_ctl *ctl,
 		return false;
 	bytes = (j - i) * ctl->unit;
 	info->bytes += bytes;
+
+	/* See try_merge_free_space() comment. */
+	if (!btrfs_free_space_trimmed(bitmap))
+		info->trim_state = BTRFS_TRIM_STATE_UNTRIMMED;
 
 	if (update_stat)
 		bitmap_clear_bits(ctl, bitmap, end, bytes);
@@ -2283,6 +2317,10 @@ static bool steal_from_bitmap_to_front(struct btrfs_free_space_ctl *ctl,
 	info->offset -= bytes;
 	info->bytes += bytes;
 
+	/* See try_merge_free_space() comment. */
+	if (!btrfs_free_space_trimmed(bitmap))
+		info->trim_state = BTRFS_TRIM_STATE_UNTRIMMED;
+
 	if (update_stat)
 		bitmap_clear_bits(ctl, bitmap, info->offset, bytes);
 	else
@@ -2332,7 +2370,8 @@ static void steal_from_bitmap(struct btrfs_free_space_ctl *ctl,
 
 int __btrfs_add_free_space(struct btrfs_fs_info *fs_info,
 			   struct btrfs_free_space_ctl *ctl,
-			   u64 offset, u64 bytes)
+			   u64 offset, u64 bytes,
+			   enum btrfs_trim_state trim_state)
 {
 	struct btrfs_free_space *info;
 	int ret = 0;
@@ -2343,6 +2382,7 @@ int __btrfs_add_free_space(struct btrfs_fs_info *fs_info,
 
 	info->offset = offset;
 	info->bytes = bytes;
+	info->trim_state = trim_state;
 	RB_CLEAR_NODE(&info->offset_index);
 
 	spin_lock(&ctl->tree_lock);
@@ -2390,7 +2430,7 @@ int btrfs_add_free_space(struct btrfs_block_group_cache *block_group,
 {
 	return __btrfs_add_free_space(block_group->fs_info,
 				      block_group->free_space_ctl,
-				      bytenr, size);
+				      bytenr, size, 0);
 }
 
 int btrfs_remove_free_space(struct btrfs_block_group_cache *block_group,
@@ -2465,8 +2505,11 @@ again:
 			}
 			spin_unlock(&ctl->tree_lock);
 
-			ret = btrfs_add_free_space(block_group, offset + bytes,
-						   old_end - (offset + bytes));
+			ret = __btrfs_add_free_space(block_group->fs_info,
+						     ctl,
+						     offset + bytes,
+						     old_end - (offset + bytes),
+						     info->trim_state);
 			WARN_ON(ret);
 			goto out;
 		}
@@ -2635,6 +2678,7 @@ u64 btrfs_find_space_for_alloc(struct btrfs_block_group_cache *block_group,
 	u64 ret = 0;
 	u64 align_gap = 0;
 	u64 align_gap_len = 0;
+	enum btrfs_trim_state align_gap_trim_state = BTRFS_TRIM_STATE_UNTRIMMED;
 
 	spin_lock(&ctl->tree_lock);
 	entry = find_free_space(ctl, &offset, &bytes_search,
@@ -2651,6 +2695,7 @@ u64 btrfs_find_space_for_alloc(struct btrfs_block_group_cache *block_group,
 		unlink_free_space(ctl, entry);
 		align_gap_len = offset - entry->offset;
 		align_gap = entry->offset;
+		align_gap_trim_state = entry->trim_state;
 
 		entry->offset = offset + bytes;
 		WARN_ON(entry->bytes < bytes + align_gap_len);
@@ -2666,7 +2711,8 @@ out:
 
 	if (align_gap_len)
 		__btrfs_add_free_space(block_group->fs_info, ctl,
-				       align_gap, align_gap_len);
+				       align_gap, align_gap_len,
+				       align_gap_trim_state);
 	return ret;
 }
 

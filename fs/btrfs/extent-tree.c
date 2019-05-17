@@ -2782,6 +2782,7 @@ fetch_cluster_info(struct btrfs_fs_info *fs_info,
 
 static int unpin_extent_range(struct btrfs_fs_info *fs_info,
 			      u64 start, u64 end,
+			      enum btrfs_trim_state trim_state,
 			      const bool return_free_space)
 {
 	struct btrfs_block_group_cache *cache = NULL;
@@ -2815,7 +2816,9 @@ static int unpin_extent_range(struct btrfs_fs_info *fs_info,
 		if (start < cache->last_byte_to_unpin) {
 			len = min(len, cache->last_byte_to_unpin - start);
 			if (return_free_space)
-				btrfs_add_free_space(cache, start, len);
+				__btrfs_add_free_space(fs_info,
+						       cache->free_space_ctl,
+						       start, len, trim_state);
 		}
 
 		start += len;
@@ -2893,6 +2896,7 @@ int btrfs_finish_extent_commit(struct btrfs_trans_handle *trans)
 
 	while (!trans->aborted) {
 		struct extent_state *cached_state = NULL;
+		enum btrfs_trim_state trim_state = BTRFS_TRIM_STATE_UNTRIMMED;
 
 		mutex_lock(&fs_info->unused_bg_unpin_mutex);
 		ret = find_first_extent_bit(unpin, 0, &start, &end,
@@ -2902,12 +2906,14 @@ int btrfs_finish_extent_commit(struct btrfs_trans_handle *trans)
 			break;
 		}
 
-		if (btrfs_test_opt(fs_info, DISCARD_SYNC))
+		if (btrfs_test_opt(fs_info, DISCARD_SYNC)) {
 			ret = btrfs_discard_extent(fs_info, start,
 						   end + 1 - start, NULL);
+			trim_state = BTRFS_TRIM_STATE_TRIMMED;
+		}
 
 		clear_extent_dirty(unpin, start, end, &cached_state);
-		unpin_extent_range(fs_info, start, end, true);
+		unpin_extent_range(fs_info, start, end, trim_state, true);
 		mutex_unlock(&fs_info->unused_bg_unpin_mutex);
 		free_extent_state(cached_state);
 		cond_resched();
@@ -5510,7 +5516,8 @@ u64 btrfs_account_ro_block_groups_free_space(struct btrfs_space_info *sinfo)
 int btrfs_error_unpin_extent_range(struct btrfs_fs_info *fs_info,
 				   u64 start, u64 end)
 {
-	return unpin_extent_range(fs_info, start, end, false);
+	return unpin_extent_range(fs_info, start, end,
+				  BTRFS_TRIM_STATE_UNTRIMMED, false);
 }
 
 /*

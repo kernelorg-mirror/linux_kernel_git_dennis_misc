@@ -21,6 +21,7 @@
 #include "space-info.h"
 #include "delalloc-space.h"
 #include "block-group.h"
+#include "discard.h"
 
 #define BITS_PER_BITMAP		(PAGE_SIZE * 8UL)
 #define MAX_CACHE_BYTES_PER_GIG	SZ_32K
@@ -756,9 +757,11 @@ static int __load_free_space_cache(struct btrfs_root *root, struct inode *inode,
 		/*
 		 * Sync discard ensures that the free space cache is always
 		 * trimmed.  So when reading this in, the state should reflect
-		 * that.
+		 * that.  We also do this for async as a stop gap for lack of
+		 * persistence.
 		 */
-		if (btrfs_test_opt(fs_info, DISCARD_SYNC))
+		if (btrfs_test_opt(fs_info, DISCARD_SYNC) ||
+		    btrfs_test_opt(fs_info, DISCARD_ASYNC))
 			e->trim_state = BTRFS_TRIM_STATE_TRIMMED;
 
 		if (!e->bytes) {
@@ -2385,6 +2388,7 @@ int __btrfs_add_free_space(struct btrfs_fs_info *fs_info,
 			   u64 offset, u64 bytes,
 			   enum btrfs_trim_state trim_state)
 {
+	struct btrfs_block_group_cache *cache = ctl->private;
 	struct btrfs_free_space *info;
 	int ret = 0;
 
@@ -2433,6 +2437,9 @@ out:
 		btrfs_crit(fs_info, "unable to add free space :%d", ret);
 		ASSERT(ret != -EEXIST);
 	}
+
+	if (trim_state != BTRFS_TRIM_STATE_TRIMMED)
+		btrfs_discard_queue_work(&fs_info->discard_ctl, cache);
 
 	return ret;
 }
@@ -3207,6 +3214,7 @@ void btrfs_init_free_cluster(struct btrfs_free_cluster *cluster)
 static int do_trimming(struct btrfs_block_group_cache *block_group,
 		       u64 *total_trimmed, u64 start, u64 bytes,
 		       u64 reserved_start, u64 reserved_bytes,
+		       enum btrfs_trim_state reserved_trim_state,
 		       struct btrfs_trim_range *trim_entry)
 {
 	struct btrfs_space_info *space_info = block_group->space_info;
@@ -3214,6 +3222,9 @@ static int do_trimming(struct btrfs_block_group_cache *block_group,
 	struct btrfs_free_space_ctl *ctl = block_group->free_space_ctl;
 	int ret;
 	int update = 0;
+	u64 end = start + bytes;
+	u64 reserved_end = reserved_start + reserved_bytes;
+	enum btrfs_trim_state trim_state;
 	u64 trimmed = 0;
 
 	spin_lock(&space_info->lock);
@@ -3227,11 +3238,20 @@ static int do_trimming(struct btrfs_block_group_cache *block_group,
 	spin_unlock(&space_info->lock);
 
 	ret = btrfs_discard_extent(fs_info, start, bytes, &trimmed);
-	if (!ret)
+	if (!ret) {
 		*total_trimmed += trimmed;
+		trim_state = BTRFS_TRIM_STATE_TRIMMED;
+	}
 
 	mutex_lock(&ctl->cache_writeout_mutex);
-	btrfs_add_free_space(block_group, reserved_start, reserved_bytes);
+	if (reserved_start < start)
+		__btrfs_add_free_space(fs_info, ctl, reserved_start,
+				       start - reserved_start,
+				       reserved_trim_state);
+	if (start + bytes < reserved_start + reserved_bytes)
+		__btrfs_add_free_space(fs_info, ctl, end, reserved_end - end,
+				       reserved_trim_state);
+	__btrfs_add_free_space(fs_info, ctl, start, bytes, trim_state);
 	list_del(&trim_entry->list);
 	mutex_unlock(&ctl->cache_writeout_mutex);
 
@@ -3258,6 +3278,7 @@ static int trim_no_bitmap(struct btrfs_block_group_cache *block_group,
 	int ret = 0;
 	u64 extent_start;
 	u64 extent_bytes;
+	enum btrfs_trim_state extent_trim_state;
 	u64 bytes;
 
 	while (start < end) {
@@ -3299,6 +3320,7 @@ static int trim_no_bitmap(struct btrfs_block_group_cache *block_group,
 
 		extent_start = entry->offset;
 		extent_bytes = entry->bytes;
+		extent_trim_state = entry->trim_state;
 		start = max(start, extent_start);
 		bytes = min(extent_start + extent_bytes, end) - start;
 		if (bytes < minlen) {
@@ -3317,7 +3339,8 @@ static int trim_no_bitmap(struct btrfs_block_group_cache *block_group,
 		mutex_unlock(&ctl->cache_writeout_mutex);
 
 		ret = do_trimming(block_group, total_trimmed, start, bytes,
-				  extent_start, extent_bytes, &trim_entry);
+				  extent_start, extent_bytes, extent_trim_state,
+				  &trim_entry);
 		if (ret)
 			break;
 next:
@@ -3443,7 +3466,7 @@ static int trim_bitmaps(struct btrfs_block_group_cache *block_group,
 		mutex_unlock(&ctl->cache_writeout_mutex);
 
 		ret = do_trimming(block_group, total_trimmed, start, bytes,
-				  start, bytes, &trim_entry);
+				  start, bytes, 0, &trim_entry);
 		if (ret) {
 			reset_trimming_bitmap(ctl, offset);
 			break;

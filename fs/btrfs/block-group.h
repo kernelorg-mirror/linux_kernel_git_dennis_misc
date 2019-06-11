@@ -115,7 +115,11 @@ struct btrfs_block_group_cache {
 	/* For read-only block groups */
 	struct list_head ro_list;
 
+	/* For discard operations */
 	atomic_t trimming;
+	struct list_head discard_list;
+	int discard_index;
+	u64 discard_eligible_time;
 
 	/* For dirty block groups */
 	struct list_head dirty_list;
@@ -156,6 +160,11 @@ struct btrfs_block_group_cache {
 	/* Record locked full stripes for RAID5/6 block group */
 	struct btrfs_full_stripe_locks_tree full_stripe_locks_root;
 };
+
+static inline u64 btrfs_block_group_end(struct btrfs_block_group_cache *cache)
+{
+	return (cache->key.objectid + cache->key.offset);
+}
 
 #ifdef CONFIG_BTRFS_DEBUG
 static inline int btrfs_should_fragment_free_space(

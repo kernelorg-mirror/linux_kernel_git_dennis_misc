@@ -338,6 +338,35 @@ bool btrfs_run_discard_work(struct btrfs_discard_ctl *discard_ctl)
 }
 
 /**
+ * btrfs_discard_update_discardable - propagate discard counters
+ * @cache: block_group of interest
+ * @ctl: free_space_ctl of @cache
+ *
+ * This propagates deltas of counters up to the discard_ctl.  It maintains a
+ * current counter and a previous counter passing the delta up to the global
+ * stat.  Then the current counter value becomes the previous counter value.
+ */
+void btrfs_discard_update_discardable(struct btrfs_block_group_cache *cache,
+				      struct btrfs_free_space_ctl *ctl)
+{
+	struct btrfs_discard_ctl *discard_ctl;
+	s32 extents_delta;
+
+	if (!cache || !btrfs_test_opt(cache->fs_info, DISCARD_ASYNC))
+		return;
+
+	discard_ctl = &cache->fs_info->discard_ctl;
+
+	extents_delta = (ctl->discardable_extents[BTRFS_STAT_CURR] -
+			 ctl->discardable_extents[BTRFS_STAT_PREV]);
+	if (extents_delta) {
+		atomic_add(extents_delta, &discard_ctl->discardable_extents);
+		ctl->discardable_extents[BTRFS_STAT_PREV] =
+			ctl->discardable_extents[BTRFS_STAT_CURR];
+	}
+}
+
+/**
  * btrfs_discard_punt_unused_bgs_list - punt unused_bgs list to discard lists
  * @fs_info: fs_info of interest
  *
@@ -422,6 +451,8 @@ void btrfs_discard_init(struct btrfs_fs_info *fs_info)
 
 	for (i = 0; i < BTRFS_NR_DISCARD_LISTS; i++)
 		 INIT_LIST_HEAD(&discard_ctl->discard_list[i]);
+
+	atomic_set(&discard_ctl->discardable_extents, 0);
 }
 
 void btrfs_discard_cleanup(struct btrfs_fs_info *fs_info)

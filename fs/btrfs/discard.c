@@ -23,21 +23,28 @@ static struct list_head *btrfs_get_discard_list(
 	return &discard_ctl->discard_list[cache->discard_index];
 }
 
-void btrfs_add_to_discard_list(struct btrfs_discard_ctl *discard_ctl,
-			       struct btrfs_block_group_cache *cache)
+static void __btrfs_add_to_discard_list(struct btrfs_discard_ctl *discard_ctl,
+					struct btrfs_block_group_cache *cache)
 {
-	spin_lock(&discard_ctl->lock);
-
 	if (list_empty(&cache->discard_list) ||
 	    cache->discard_index == BTRFS_DISCARD_INDEX_UNUSED) {
 		if (cache->discard_index == BTRFS_DISCARD_INDEX_UNUSED)
 			cache->discard_index = BTRFS_DISCARD_INDEX_START;
 		cache->discard_eligible_time = (ktime_get_ns() +
 						BTRFS_DISCARD_DELAY);
+		cache->discard_state = BTRFS_DISCARD_RESET_CURSOR;
 	}
 
 	list_move_tail(&cache->discard_list,
 		       btrfs_get_discard_list(discard_ctl, cache));
+}
+
+void btrfs_add_to_discard_list(struct btrfs_discard_ctl *discard_ctl,
+			       struct btrfs_block_group_cache *cache)
+{
+	spin_lock(&discard_ctl->lock);
+
+	__btrfs_add_to_discard_list(discard_ctl, cache);
 
 	spin_unlock(&discard_ctl->lock);
 }
@@ -52,6 +59,7 @@ void btrfs_add_to_discard_unused_list(struct btrfs_discard_ctl *discard_ctl,
 
 	cache->discard_index = BTRFS_DISCARD_INDEX_UNUSED;
 	cache->discard_eligible_time = ktime_get_ns();
+	cache->discard_state = BTRFS_DISCARD_RESET_CURSOR;
 	list_add_tail(&cache->discard_list,
 		      &discard_ctl->discard_list[BTRFS_DISCARD_INDEX_UNUSED]);
 
@@ -119,23 +127,41 @@ static struct btrfs_block_group_cache *find_next_cache(
 /**
  * peek_discard_list - wrap find_next_cache()
  * @discard_ctl: discard control
+ * @discard_state: the discard_state of the block_group after state management
  *
  * This wraps find_next_cache() and sets the cache to be in use.
+ * discard_state's control flow is managed here.  Variables related to
+ * discard_state are reset here as needed (eg discard_cursor).  @discard_state
+ * is remembered as it may change while we're discarding, but we want the
+ * discard to execute in the context determined here.
  */
 static struct btrfs_block_group_cache *peek_discard_list(
-					struct btrfs_discard_ctl *discard_ctl)
+					struct btrfs_discard_ctl *discard_ctl,
+					enum btrfs_discard_state *discard_state)
 {
 	struct btrfs_block_group_cache *cache;
 	u64 now = ktime_get_ns();
 
 	spin_lock(&discard_ctl->lock);
 
+again:
 	cache = find_next_cache(discard_ctl, now);
 
-	if (cache && now < cache->discard_eligible_time)
+	if (cache && now > cache->discard_eligible_time) {
+		if (cache->discard_index == BTRFS_DISCARD_INDEX_UNUSED &&
+		    cache->used > 0) {
+			__btrfs_add_to_discard_list(discard_ctl, cache);
+			goto again;
+		}
+		if (cache->discard_state == BTRFS_DISCARD_RESET_CURSOR) {
+			cache->discard_cursor = cache->start;
+			cache->discard_state = BTRFS_DISCARD_EXTENTS;
+		}
+		discard_ctl->cache = cache;
+		*discard_state = cache->discard_state;
+	} else {
 		cache = NULL;
-
-	discard_ctl->cache = cache;
+	}
 
 	spin_unlock(&discard_ctl->lock);
 
@@ -246,24 +272,51 @@ static void btrfs_finish_discard_pass(struct btrfs_discard_ctl *discard_ctl,
  * btrfs_discard_workfn - discard work function
  * @work: work
  *
- * This finds the next cache to start discarding and then discards it.
+ * This finds the next cache to start discarding and then discards a single
+ * region.  It does this in a two-pass fashion: first extents and second
+ * bitmaps.  Completely discarded block groups are sent to the unused_bgs path.
  */
 static void btrfs_discard_workfn(struct work_struct *work)
 {
 	struct btrfs_discard_ctl *discard_ctl;
 	struct btrfs_block_group_cache *cache;
+	enum btrfs_discard_state discard_state;
 	u64 trimmed = 0;
 
 	discard_ctl = container_of(work, struct btrfs_discard_ctl, work.work);
 
-	cache = peek_discard_list(discard_ctl);
+	cache = peek_discard_list(discard_ctl, &discard_state);
 	if (!cache || !btrfs_run_discard_work(discard_ctl))
 		return;
 
-	btrfs_trim_block_group(cache, &trimmed, cache->start,
-			       btrfs_block_group_end(cache), 0);
+	/* Perform discarding. */
+	if (discard_state == BTRFS_DISCARD_BITMAPS)
+		btrfs_trim_block_group_bitmaps(cache, &trimmed,
+					       cache->discard_cursor,
+					       btrfs_block_group_end(cache),
+					       0, true);
+	else
+		btrfs_trim_block_group_extents(cache, &trimmed,
+					       cache->discard_cursor,
+					       btrfs_block_group_end(cache),
+					       0, true);
 
-	btrfs_finish_discard_pass(discard_ctl, cache);
+	/* Determine next steps for a block_group. */
+	if (cache->discard_cursor >= btrfs_block_group_end(cache)) {
+		if (discard_state == BTRFS_DISCARD_BITMAPS) {
+			btrfs_finish_discard_pass(discard_ctl, cache);
+		} else {
+			cache->discard_cursor = cache->start;
+			spin_lock(&discard_ctl->lock);
+			if (cache->discard_state != BTRFS_DISCARD_RESET_CURSOR)
+				cache->discard_state = BTRFS_DISCARD_BITMAPS;
+			spin_unlock(&discard_ctl->lock);
+		}
+	}
+
+	spin_lock(&discard_ctl->lock);
+	discard_ctl->cache = NULL;
+	spin_unlock(&discard_ctl->lock);
 
 	btrfs_discard_schedule_work(discard_ctl, false);
 }

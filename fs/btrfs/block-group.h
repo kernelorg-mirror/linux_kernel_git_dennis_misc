@@ -181,6 +181,12 @@ static inline u64 btrfs_block_group_end(struct btrfs_block_group_cache *cache)
 	return (cache->key.objectid + cache->key.offset);
 }
 
+static inline bool btrfs_is_block_group_data(
+					struct btrfs_block_group_cache *cache)
+{
+	return (cache->flags & BTRFS_BLOCK_GROUP_DATA);
+}
+
 #ifdef CONFIG_BTRFS_DEBUG
 static inline int btrfs_should_fragment_free_space(
 		struct btrfs_block_group_cache *block_group)

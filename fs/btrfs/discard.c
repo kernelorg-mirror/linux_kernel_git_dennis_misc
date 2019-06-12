@@ -51,6 +51,9 @@ static void __btrfs_add_to_discard_list(struct btrfs_discard_ctl *discard_ctl,
 void btrfs_add_to_discard_list(struct btrfs_discard_ctl *discard_ctl,
 			       struct btrfs_block_group_cache *cache)
 {
+	if (!btrfs_is_block_group_data(cache))
+		return;
+
 	spin_lock(&discard_ctl->lock);
 
 	__btrfs_add_to_discard_list(discard_ctl, cache);
@@ -161,7 +164,10 @@ again:
 	if (cache && now > cache->discard_eligible_time) {
 		if (cache->discard_index == BTRFS_DISCARD_INDEX_UNUSED &&
 		    btrfs_block_group_used(&cache->item) != 0) {
-			__btrfs_add_to_discard_list(discard_ctl, cache);
+			if (btrfs_is_block_group_data(cache))
+				__btrfs_add_to_discard_list(discard_ctl, cache);
+			else
+				list_del_init(&cache->discard_list);
 			goto again;
 		}
 		if (cache->discard_state == BTRFS_DISCARD_RESET_CURSOR) {
@@ -492,7 +498,8 @@ void btrfs_discard_update_discardable(struct btrfs_block_group_cache *cache,
 	s32 extents_delta;
 	s64 bytes_delta;
 
-	if (!cache || !btrfs_test_opt(cache->fs_info, DISCARD_ASYNC))
+	if (!cache || !btrfs_test_opt(cache->fs_info, DISCARD_ASYNC) ||
+	    !btrfs_is_block_group_data(cache))
 		return;
 
 	discard_ctl = &cache->fs_info->discard_ctl;

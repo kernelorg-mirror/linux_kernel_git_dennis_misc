@@ -28,12 +28,32 @@ void btrfs_add_to_discard_list(struct btrfs_discard_ctl *discard_ctl,
 {
 	spin_lock(&discard_ctl->lock);
 
-	if (list_empty(&cache->discard_list))
+	if (list_empty(&cache->discard_list) ||
+	    cache->discard_index == BTRFS_DISCARD_INDEX_UNUSED) {
+		if (cache->discard_index == BTRFS_DISCARD_INDEX_UNUSED)
+			cache->discard_index = BTRFS_DISCARD_INDEX_START;
 		cache->discard_eligible_time = (ktime_get_ns() +
 						BTRFS_DISCARD_DELAY);
+	}
 
 	list_move_tail(&cache->discard_list,
 		       btrfs_get_discard_list(discard_ctl, cache));
+
+	spin_unlock(&discard_ctl->lock);
+}
+
+void btrfs_add_to_discard_unused_list(struct btrfs_discard_ctl *discard_ctl,
+				      struct btrfs_block_group_cache *cache)
+{
+	spin_lock(&discard_ctl->lock);
+
+	if (!list_empty(&cache->discard_list))
+		list_del_init(&cache->discard_list);
+
+	cache->discard_index = BTRFS_DISCARD_INDEX_UNUSED;
+	cache->discard_eligible_time = ktime_get_ns();
+	list_add_tail(&cache->discard_list,
+		      &discard_ctl->discard_list[BTRFS_DISCARD_INDEX_UNUSED]);
 
 	spin_unlock(&discard_ctl->lock);
 }
@@ -152,7 +172,11 @@ void btrfs_discard_queue_work(struct btrfs_discard_ctl *discard_ctl,
 	if (!cache || !btrfs_test_opt(cache->fs_info, DISCARD_ASYNC))
 		return;
 
-	btrfs_add_to_discard_list(discard_ctl, cache);
+	if (btrfs_block_group_used(&cache->item) == 0)
+		btrfs_add_to_discard_unused_list(discard_ctl, cache);
+	else
+		btrfs_add_to_discard_list(discard_ctl, cache);
+
 	if (!delayed_work_pending(&discard_ctl->work))
 		btrfs_discard_schedule_work(discard_ctl, false);
 }
@@ -198,6 +222,27 @@ out:
 }
 
 /**
+ * btrfs_finish_discard_pass - determine next step of a block_group
+ *
+ * This determines the next step for a block group after it's finished going
+ * through a pass on a discard list.  If it is unused and fully trimmed, we can
+ * mark it unused and send it to the unused_bgs path.  Otherwise, pass it onto
+ * the appropriate filter list or let it fall off.
+ */
+static void btrfs_finish_discard_pass(struct btrfs_discard_ctl *discard_ctl,
+				      struct btrfs_block_group_cache *cache)
+{
+	remove_from_discard_list(discard_ctl, cache);
+
+	if (btrfs_block_group_used(&cache->item) == 0) {
+		if (btrfs_is_free_space_trimmed(cache))
+			btrfs_mark_bg_unused(cache);
+		else
+			btrfs_add_to_discard_unused_list(discard_ctl, cache);
+	}
+}
+
+/**
  * btrfs_discard_workfn - discard work function
  * @work: work
  *
@@ -218,7 +263,7 @@ static void btrfs_discard_workfn(struct work_struct *work)
 	btrfs_trim_block_group(cache, &trimmed, cache->key.objectid,
 			       btrfs_block_group_end(cache), 0);
 
-	remove_from_discard_list(discard_ctl, cache);
+	btrfs_finish_discard_pass(discard_ctl, cache);
 
 	btrfs_discard_schedule_work(discard_ctl, false);
 }
@@ -239,12 +284,71 @@ bool btrfs_run_discard_work(struct btrfs_discard_ctl *discard_ctl)
 		test_bit(BTRFS_FS_DISCARD_RUNNING, &fs_info->flags));
 }
 
+/**
+ * btrfs_discard_punt_unused_bgs_list - punt unused_bgs list to discard lists
+ * @fs_info: fs_info of interest
+ *
+ * The unused_bgs list needs to be punted to the discard lists because the
+ * order of operations is changed.  In the normal sychronous discard path, the
+ * block groups are trimmed via a single large trim in transaction commit.  This
+ * is ultimately what we are trying to avoid with asynchronous discard.  Thus,
+ * it must be done before going down the unused_bgs path.
+ */
+void btrfs_discard_punt_unused_bgs_list(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_block_group_cache *cache, *next;
+
+	spin_lock(&fs_info->unused_bgs_lock);
+
+	/* We enabled async discard, so punt all to the queue. */
+	list_for_each_entry_safe(cache, next, &fs_info->unused_bgs, bg_list) {
+		list_del_init(&cache->bg_list);
+		btrfs_add_to_discard_unused_list(&fs_info->discard_ctl, cache);
+	}
+
+	spin_unlock(&fs_info->unused_bgs_lock);
+}
+
+/**
+ * btrfs_discard_purge_list - purge discard lists
+ * @discard_ctl: discard control
+ *
+ * If we are disabling async discard, we may have intercepted block groups that
+ * are completely free and ready for the unused_bgs path.  As discarding will
+ * now happen in transaction commit or not at all, we can safely mark the
+ * corresponding block groups as unused and they will be sent on their merry
+ * way to the unused_bgs list.
+ */
+static void btrfs_discard_purge_list(struct btrfs_discard_ctl *discard_ctl)
+{
+	struct btrfs_block_group_cache *cache, *next;
+	int i;
+
+	spin_lock(&discard_ctl->lock);
+
+	for (i = 0; i < BTRFS_NR_DISCARD_LISTS; i++) {
+		list_for_each_entry_safe(cache, next,
+					 &discard_ctl->discard_list[i],
+					 discard_list) {
+			list_del_init(&cache->discard_list);
+			spin_unlock(&discard_ctl->lock);
+			if (btrfs_block_group_used(&cache->item) == 0)
+				btrfs_mark_bg_unused(cache);
+			spin_lock(&discard_ctl->lock);
+		}
+	}
+
+	spin_unlock(&discard_ctl->lock);
+}
+
 void btrfs_discard_resume(struct btrfs_fs_info *fs_info)
 {
 	if (!btrfs_test_opt(fs_info, DISCARD_ASYNC)) {
 		btrfs_discard_cleanup(fs_info);
 		return;
 	}
+
+	btrfs_discard_punt_unused_bgs_list(fs_info);
 
 	set_bit(BTRFS_FS_DISCARD_RUNNING, &fs_info->flags);
 }
@@ -271,4 +375,6 @@ void btrfs_discard_cleanup(struct btrfs_fs_info *fs_info)
 {
 	btrfs_discard_stop(fs_info);
 	cancel_delayed_work_sync(&fs_info->discard_ctl.work);
+
+	btrfs_discard_purge_list(&fs_info->discard_ctl);
 }

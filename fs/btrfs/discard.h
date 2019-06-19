@@ -13,12 +13,16 @@ struct btrfs_block_group_cache;
 
 /* Discard size limits. */
 #define BTRFS_ASYNC_DISCARD_MAX_SIZE	(SZ_64M)
+#define BTRFS_ASYNC_DISCARD_MAX_FILTER	(SZ_1M)
+#define BTRFS_ASYNC_DISCARD_MIN_FILTER	(SZ_32K)
 
 /* List operations. */
 void btrfs_add_to_discard_list(struct btrfs_discard_ctl *discard_ctl,
 			       struct btrfs_block_group_cache *cache);
 void btrfs_add_to_discard_unused_list(struct btrfs_discard_ctl *discard_ctl,
 				      struct btrfs_block_group_cache *cache);
+void btrfs_discard_check_filter(struct btrfs_block_group_cache *cache,
+				u64 bytes);
 
 /* Work operations. */
 void btrfs_discard_cancel_work(struct btrfs_discard_ctl *discard_ctl,

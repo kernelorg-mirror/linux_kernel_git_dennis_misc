@@ -58,6 +58,7 @@ struct io_worker {
 
 	struct rcu_head rcu;
 	struct mm_struct *mm;
+	struct cgroup_subsys_state *blkcg_css;
 	const struct cred *cur_creds;
 	const struct cred *saved_creds;
 	struct files_struct *restore_files;
@@ -175,6 +176,13 @@ static bool __io_worker_unuse(struct io_wqe *wqe, struct io_worker *worker)
 		mmput(worker->mm);
 		worker->mm = NULL;
 	}
+
+#ifdef CONFIG_BLK_CGROUP
+	if (worker->blkcg_css) {
+		kthread_associate_blkcg(NULL);
+		worker->blkcg_css = NULL;
+	}
+#endif
 
 	return dropped_lock;
 }
@@ -440,6 +448,20 @@ static void io_wq_switch_mm(struct io_worker *worker, struct io_wq_work *work)
 	work->flags |= IO_WQ_WORK_CANCEL;
 }
 
+#ifdef CONFIG_BLK_CGROUP
+static inline void io_wq_switch_blkcg(struct io_worker *worker,
+				      struct io_wq_work *work)
+{
+	if (work->blkcg_css != worker->blkcg_css)
+		kthread_associate_blkcg(work->blkcg_css);
+}
+#else
+static inline void io_wq_switch_blkcg(struct io_worker *worker,
+				      struct io_wq_work *work)
+{
+}
+#endif
+
 static void io_wq_switch_creds(struct io_worker *worker,
 			       struct io_wq_work *work)
 {
@@ -466,6 +488,7 @@ static void io_impersonate_work(struct io_worker *worker,
 		io_wq_switch_mm(worker, work);
 	if (worker->cur_creds != work->creds)
 		io_wq_switch_creds(worker, work);
+	io_wq_switch_blkcg(worker, work);
 }
 
 static void io_assign_current_work(struct io_worker *worker,

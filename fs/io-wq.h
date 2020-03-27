@@ -88,6 +88,7 @@ struct io_wq_work {
 	void (*func)(struct io_wq_work **);
 	struct files_struct *files;
 	struct mm_struct *mm;
+	struct cgroup_subsys_state *blkcg_css;
 	const struct cred *creds;
 	struct fs_struct *fs;
 	unsigned flags;

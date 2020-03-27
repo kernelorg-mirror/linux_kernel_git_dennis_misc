@@ -79,6 +79,7 @@
 #include <linux/fs_struct.h>
 #include <linux/splice.h>
 #include <linux/task_work.h>
+#include <linux/blk-cgroup.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/io_uring.h>
@@ -673,6 +674,8 @@ struct io_op_def {
 	unsigned		async_ctx : 1;
 	/* needs current->mm setup, does mm access */
 	unsigned		needs_mm : 1;
+	/* needs blkcg context, issues async io */
+	unsigned		needs_blkcg : 1;
 	/* needs req->file assigned */
 	unsigned		needs_file : 1;
 	/* needs req->file assigned IFF fd is >= 0 */
@@ -699,6 +702,7 @@ static const struct io_op_def io_op_defs[] = {
 	[IORING_OP_READV] = {
 		.async_ctx		= 1,
 		.needs_mm		= 1,
+		.needs_blkcg		= 1,
 		.needs_file		= 1,
 		.unbound_nonreg_file	= 1,
 		.pollin			= 1,
@@ -707,20 +711,24 @@ static const struct io_op_def io_op_defs[] = {
 	[IORING_OP_WRITEV] = {
 		.async_ctx		= 1,
 		.needs_mm		= 1,
+		.needs_blkcg		= 1,
 		.needs_file		= 1,
 		.hash_reg_file		= 1,
 		.unbound_nonreg_file	= 1,
 		.pollout		= 1,
 	},
 	[IORING_OP_FSYNC] = {
+		.needs_blkcg		= 1,
 		.needs_file		= 1,
 	},
 	[IORING_OP_READ_FIXED] = {
+		.needs_blkcg		= 1,
 		.needs_file		= 1,
 		.unbound_nonreg_file	= 1,
 		.pollin			= 1,
 	},
 	[IORING_OP_WRITE_FIXED] = {
+		.needs_blkcg		= 1,
 		.needs_file		= 1,
 		.hash_reg_file		= 1,
 		.unbound_nonreg_file	= 1,
@@ -732,10 +740,12 @@ static const struct io_op_def io_op_defs[] = {
 	},
 	[IORING_OP_POLL_REMOVE] = {},
 	[IORING_OP_SYNC_FILE_RANGE] = {
+		.needs_blkcg		= 1,
 		.needs_file		= 1,
 	},
 	[IORING_OP_SENDMSG] = {
 		.async_ctx		= 1,
+		.needs_blkcg		= 1,
 		.needs_mm		= 1,
 		.needs_file		= 1,
 		.unbound_nonreg_file	= 1,
@@ -776,15 +786,18 @@ static const struct io_op_def io_op_defs[] = {
 		.pollout		= 1,
 	},
 	[IORING_OP_FALLOCATE] = {
+		.needs_blkcg		= 1,
 		.needs_file		= 1,
 	},
 	[IORING_OP_OPENAT] = {
+		.needs_blkcg		= 1,
 		.needs_file		= 1,
 		.fd_non_neg		= 1,
 		.file_table		= 1,
 		.needs_fs		= 1,
 	},
 	[IORING_OP_CLOSE] = {
+		.needs_blkcg		= 1,
 		.needs_file		= 1,
 		.file_table		= 1,
 	},
@@ -794,12 +807,14 @@ static const struct io_op_def io_op_defs[] = {
 	},
 	[IORING_OP_STATX] = {
 		.needs_mm		= 1,
+		.needs_blkcg		= 1,
 		.needs_file		= 1,
 		.fd_non_neg		= 1,
 		.needs_fs		= 1,
 	},
 	[IORING_OP_READ] = {
 		.needs_mm		= 1,
+		.needs_blkcg		= 1,
 		.needs_file		= 1,
 		.unbound_nonreg_file	= 1,
 		.pollin			= 1,
@@ -807,18 +822,22 @@ static const struct io_op_def io_op_defs[] = {
 	},
 	[IORING_OP_WRITE] = {
 		.needs_mm		= 1,
+		.needs_blkcg		= 1,
 		.needs_file		= 1,
 		.unbound_nonreg_file	= 1,
 		.pollout		= 1,
 	},
 	[IORING_OP_FADVISE] = {
+		.needs_blkcg		= 1,
 		.needs_file		= 1,
 	},
 	[IORING_OP_MADVISE] = {
 		.needs_mm		= 1,
+		.needs_blkcg		= 1,
 	},
 	[IORING_OP_SEND] = {
 		.needs_mm		= 1,
+		.needs_blkcg		= 1,
 		.needs_file		= 1,
 		.unbound_nonreg_file	= 1,
 		.pollout		= 1,
@@ -831,6 +850,7 @@ static const struct io_op_def io_op_defs[] = {
 		.buffer_select		= 1,
 	},
 	[IORING_OP_OPENAT2] = {
+		.needs_blkcg		= 1,
 		.needs_file		= 1,
 		.fd_non_neg		= 1,
 		.file_table		= 1,
@@ -841,6 +861,7 @@ static const struct io_op_def io_op_defs[] = {
 		.file_table		= 1,
 	},
 	[IORING_OP_SPLICE] = {
+		.needs_blkcg		= 1,
 		.needs_file		= 1,
 		.hash_reg_file		= 1,
 		.unbound_nonreg_file	= 1,
@@ -1017,6 +1038,17 @@ static inline void io_req_work_grab_env(struct io_kiocb *req,
 		mmgrab(current->mm);
 		req->work.mm = current->mm;
 	}
+#ifdef CONFIG_BLK_CGROUP
+	if (!req->work.blkcg_css && def->needs_blkcg) {
+		req->work.blkcg_css = blkcg_css();
+		/*
+		 * If we don't get a css, then the kthread will already
+		 * be in kernel context and grab the root css.
+		 */
+		if (!css_tryget_online(req->work.blkcg_css))
+			req->work.blkcg_css = NULL;
+	}
+#endif
 	if (!req->work.creds)
 		req->work.creds = get_current_cred();
 	if (!req->work.fs && def->needs_fs) {
@@ -1039,6 +1071,10 @@ static inline void io_req_work_drop_env(struct io_kiocb *req)
 		mmdrop(req->work.mm);
 		req->work.mm = NULL;
 	}
+#ifdef CONFIG_BLK_CGROUP
+	if (req->work.blkcg_css)
+		css_put(req->work.blkcg_css);
+#endif
 	if (req->work.creds) {
 		put_cred(req->work.creds);
 		req->work.creds = NULL;

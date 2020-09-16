@@ -87,6 +87,9 @@ struct io_wq_work {
 	struct io_wq_work_node list;
 	struct files_struct *files;
 	struct mm_struct *mm;
+#ifdef CONFIG_BLK_CGROUP
+	struct cgroup_subsys_state *blkcg_css;
+#endif
 	const struct cred *creds;
 	struct fs_struct *fs;
 	unsigned long fsize;

@@ -145,7 +145,7 @@ static int percpu_stats_show(struct seq_file *m, void *v)
 	int slot, max_nr_alloc;
 	int *buffer;
 	enum pcpu_chunk_type type;
-	int nr_empty_pop_pages;
+	int nr_empty_pop_pages, nr_isolated_empty_pop_pages;
 
 alloc_buffer:
 	spin_lock_irq(&pcpu_lock);
@@ -167,8 +167,11 @@ alloc_buffer:
 	}
 
 	nr_empty_pop_pages = 0;
-	for (type = 0; type < PCPU_NR_CHUNK_TYPES; type++)
+	nr_isolated_empty_pop_pages = 0;
+	for (type = 0; type < PCPU_NR_CHUNK_TYPES; type++) {
 		nr_empty_pop_pages += pcpu_nr_empty_pop_pages[type];
+		nr_isolated_empty_pop_pages += pcpu_nr_isolated_empty_pop_pages[type];
+	}
 
 #define PL(X)								\
 	seq_printf(m, "  %-20s: %12lld\n", #X, (long long int)pcpu_stats_ai.X)
@@ -202,6 +205,7 @@ alloc_buffer:
 	PU(min_alloc_size);
 	PU(max_alloc_size);
 	P("empty_pop_pages", nr_empty_pop_pages);
+	P("iso_empty_pop_pages", nr_isolated_empty_pop_pages);
 	seq_putc(m, '\n');
 
 #undef PU

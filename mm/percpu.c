@@ -110,6 +110,9 @@
 #define PCPU_EMPTY_POP_PAGES_LOW	2
 #define PCPU_EMPTY_POP_PAGES_HIGH	4
 
+/* only schedule reclaim if there are at least N empty pop pages sidelined */
+#define PCPU_EMPTY_POP_RECLAIM_THRESHOLD	4
+
 #ifdef CONFIG_SMP
 /* default addr <-> pcpu_ptr mapping, override in asm/percpu.h if necessary */
 #ifndef __addr_to_pcpu_ptr
@@ -183,6 +186,7 @@ static LIST_HEAD(pcpu_map_extend_chunks);
  * The reserved chunk doesn't contribute to the count.
  */
 int pcpu_nr_empty_pop_pages[PCPU_NR_CHUNK_TYPES];
+int pcpu_nr_isolated_empty_pop_pages[PCPU_NR_CHUNK_TYPES];
 
 /*
  * The number of populated pages in use by the allocator, protected by
@@ -582,8 +586,10 @@ static void pcpu_isolate_chunk(struct pcpu_chunk *chunk)
 	if (!chunk->isolated) {
 		chunk->isolated = true;
 		pcpu_nr_empty_pop_pages[type] -= chunk->nr_empty_pop_pages;
+		pcpu_nr_isolated_empty_pop_pages[type] +=
+			chunk->nr_empty_pop_pages;
+		list_move(&chunk->list, &pcpu_slot[pcpu_sidelined_slot]);
 	}
-	list_move(&chunk->list, &pcpu_slot[pcpu_to_depopulate_slot]);
 }
 
 static void pcpu_reintegrate_chunk(struct pcpu_chunk *chunk)
@@ -595,6 +601,8 @@ static void pcpu_reintegrate_chunk(struct pcpu_chunk *chunk)
 	if (chunk->isolated) {
 		chunk->isolated = false;
 		pcpu_nr_empty_pop_pages[type] += chunk->nr_empty_pop_pages;
+		pcpu_nr_isolated_empty_pop_pages[type] -=
+			chunk->nr_empty_pop_pages;
 		pcpu_chunk_relocate(chunk, -1);
 	}
 }
@@ -610,9 +618,16 @@ static void pcpu_reintegrate_chunk(struct pcpu_chunk *chunk)
  */
 static inline void pcpu_update_empty_pages(struct pcpu_chunk *chunk, int nr)
 {
+	enum pcpu_chunk_type type = pcpu_chunk_type(chunk);
+
 	chunk->nr_empty_pop_pages += nr;
-	if (chunk != pcpu_reserved_chunk && !chunk->isolated)
-		pcpu_nr_empty_pop_pages[pcpu_chunk_type(chunk)] += nr;
+	if (chunk != pcpu_reserved_chunk) {
+		if (chunk->isolated)
+			pcpu_nr_isolated_empty_pop_pages[type] += nr;
+		else
+			pcpu_nr_empty_pop_pages[type] += nr;
+
+	}
 }
 
 /*
@@ -2138,9 +2153,12 @@ static void pcpu_reclaim_populated(enum pcpu_chunk_type type)
 	struct list_head *pcpu_slot = pcpu_chunk_list(type);
 	struct pcpu_chunk *chunk;
 	struct pcpu_block_md *block;
+	LIST_HEAD(to_depopulate);
 	int i, end;
 
 	spin_lock_irq(&pcpu_lock);
+
+	list_splice_init(&pcpu_slot[pcpu_to_depopulate_slot], &to_depopulate);
 
 restart:
 	/*
@@ -2149,9 +2167,9 @@ restart:
 	 * other accessor is the free path which only returns area back to the
 	 * allocator not touching the populated bitmap.
 	 */
-	while (!list_empty(&pcpu_slot[pcpu_to_depopulate_slot])) {
-		chunk = list_first_entry(&pcpu_slot[pcpu_to_depopulate_slot],
-					 struct pcpu_chunk, list);
+	while (!list_empty(&to_depopulate)) {
+		chunk = list_first_entry(&to_depopulate, struct pcpu_chunk,
+					 list);
 		WARN_ON(chunk->immutable);
 
 		/*
@@ -2206,6 +2224,13 @@ restart:
 		else
 			list_move(&chunk->list,
 				  &pcpu_slot[pcpu_sidelined_slot]);
+	}
+
+	if (pcpu_nr_isolated_empty_pop_pages[type] >=
+	    PCPU_EMPTY_POP_RECLAIM_THRESHOLD) {
+		list_splice_tail_init(&pcpu_slot[pcpu_sidelined_slot],
+				      &pcpu_slot[pcpu_to_depopulate_slot]);
+		pcpu_schedule_balance_work();
 	}
 
 	spin_unlock_irq(&pcpu_lock);
@@ -2291,7 +2316,13 @@ void free_percpu(void __percpu *ptr)
 			}
 	} else if (pcpu_should_reclaim_chunk(chunk)) {
 		pcpu_isolate_chunk(chunk);
-		need_balance = true;
+		if (chunk->free_bytes == pcpu_unit_size ||
+		    pcpu_nr_isolated_empty_pop_pages[pcpu_chunk_type(chunk)] >=
+		    PCPU_EMPTY_POP_RECLAIM_THRESHOLD) {
+			list_splice_tail_init(&pcpu_slot[pcpu_sidelined_slot],
+					      &pcpu_slot[pcpu_to_depopulate_slot]);
+			need_balance = true;
+		}
 	}
 
 	trace_percpu_free_percpu(chunk->base_addr, off, ptr);
